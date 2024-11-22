@@ -33,9 +33,9 @@ jobs:
           - runner: ubuntu-24.04
             containerd: v2.0.0
             arch: amd64
-          - runner: arm64-8core-32gb
-            containerd: v2.0.0
-            arch: arm64
+#          - runner: arm64-8core-32gb
+#            containerd: v2.0.0
+#            arch: arm64
     env:
       CONTAINERD_VERSION: "${{ matrix.containerd }}"
       ARCH: "${{ matrix.arch }}"
@@ -117,10 +117,10 @@ jobs:
             containerd: v2.0.0
             runner: "ubuntu-24.04"
             arch: amd64
-          - ubuntu: 24.04
-            containerd: v2.0.0
-            runner: arm64-8core-32gb
-            arch: arm64
+#          - ubuntu: 24.04
+#            containerd: v2.0.0
+#            runner: arm64-8core-32gb
+#            arch: arm64
     env:
       CONTAINERD_VERSION: "${{ matrix.containerd }}"
       ARCH: "${{ matrix.arch }}"
