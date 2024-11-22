@@ -377,8 +377,8 @@ jobs:
       - run: go install -v gotest.tools/gotestsum@v1
       - uses: actions/checkout@v4.2.2
         with:
-          repository: containerd/containerd
-          ref: v1.7.23
+          repository: PlayEveryWare/containerd
+          ref: mendsley/windows_cni_mac
           path: containerd
           fetch-depth: 1
       - name: "Set up CNI"
