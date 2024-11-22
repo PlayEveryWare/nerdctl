@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/nerdctl/v2/pkg/defaults"
 	"github.com/containerd/nerdctl/v2/pkg/netutil"
 	"github.com/containerd/nerdctl/v2/pkg/testutil"
+	"github.com/containerd/nerdctl/v2/pkg/testutil/nettestutil"
 )
 
 // TestRunInternetConnectivity tests Internet connectivity by pinging github.com.
@@ -185,4 +186,78 @@ func TestHnsEndpointsRemovedAfterAttachedRun(t *testing.T) {
 	existingEndpoints, err = listHnsEndpointsRegex(fmt.Sprintf(".*_%s", testNet.Name))
 	assert.NilError(t, err)
 	assert.Equal(t, originalEndpointsCount, len(existingEndpoints), "the number of HNS endpoints should equal pre-test amount")
+}
+
+func TestRunContainerWithMACAddress(t *testing.T) {
+	base := testutil.NewBase(t)
+	tID := testutil.Identifier(t)
+	networkNat := "testNetworkNat" + tID
+	//networkBridge := "testNetworkBridge" + tID
+	//networkMACvlan := "testNetworkMACvlan" + tID
+	//networkIPvlan := "testNetworkIPvlan" + tID
+	tearDown := func() {
+		base.Cmd("network", "rm", networkNat).Run()
+		//base.Cmd("network", "rm", networkBridge).Run()
+		//base.Cmd("network", "rm", networkMACvlan).Run()
+		//base.Cmd("network", "rm", networkIPvlan).Run()
+	}
+
+	tearDown()
+	t.Cleanup(tearDown)
+
+	base.Cmd("network", "create", networkNat, "--driver", "nat").AssertOK()
+	//base.Cmd("network", "create", networkBridge, "--driver", "bridge").AssertOK()
+	//base.Cmd("network", "create", networkMACvlan, "--driver", "macvlan").AssertOK()
+	//base.Cmd("network", "create", networkIPvlan, "--driver", "ipvlan").AssertOK()
+
+	//defaultMac := base.Cmd("run", "--rm", "-i", "--network", networkNat, testutil.CommonImage).
+	//	CmdOption(testutil.WithStdin(strings.NewReader("powershell -Command \"Get-NetAdapter | Select-Object -ExpandProperty MacAddress\""))).
+	//	Run().Stdout()
+
+	passedMac := "we expect the generated mac on the output"
+
+	tests := []struct {
+		Network string
+		WantErr bool
+		Expect  string
+	}{
+		{"host", true, "cannot use"}, // anything but the actual address being passed
+		{"none", false, ""},          // nothing
+		{"container:whatever" + tID, true, "only supported on Linux"}, // "No such container" vs. "could not find container"
+		//{"bridge", false, passedMac},
+		{networkNat, false, passedMac},
+		//{networkBridge, false, passedMac},
+		//{networkMACvlan, false, passedMac},
+		//{networkIPvlan, true, "not support"},
+	}
+
+	for i, test := range tests {
+		containerName := fmt.Sprintf("%s_%d", tID, i)
+		testName := fmt.Sprintf("%s_container:%s_network:%s_expect:%s", tID, containerName, test.Network, test.Expect)
+		expect := test.Expect
+		network := test.Network
+		wantErr := test.WantErr
+		t.Run(testName, func(tt *testing.T) {
+			tt.Parallel()
+
+			macAddress, err := nettestutil.GenerateMACAddress()
+			if err != nil {
+				t.Errorf("failed to generate MAC address: %s", err)
+			}
+			if expect == passedMac {
+				expect = strings.ToUpper(strings.Replace(macAddress, ":", "-", -1))
+			}
+
+			res := base.Cmd("run", "--rm", "-i", "--network", network, "--mac-address", macAddress, testutil.CommonImage, "ipconfig /all").Run()
+
+			if wantErr {
+				assert.Assert(t, res.ExitCode != 0, "Command should have failed", res)
+				assert.Assert(t, strings.Contains(res.Combined(), expect), fmt.Sprintf("expected output to contain %q: %q", expect, res.Combined()))
+			} else {
+				assert.Assert(t, res.ExitCode == 0, "Command should have succeeded", res)
+				assert.Assert(t, strings.Contains(res.Stdout(), expect), fmt.Sprintf("expected output to contain %q: %q", expect, res.Stdout()))
+			}
+		})
+
+	}
 }
