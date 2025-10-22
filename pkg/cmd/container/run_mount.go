@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -120,6 +121,48 @@ func parseMountFlags(volStore volumestore.VolumeStore, options types.ContainerCr
 	}
 
 	return parsed, nil
+}
+
+// parseMountImageFlags parsed --mount-image
+func parseMountImageFlags(spec string) (imageRef string, target string, readonly bool, err error) {
+	parts := strings.Split(spec, ",")
+	if len(parts) < 2 {
+		return "", "", false, fmt.Errorf("invalid mount-image format %q, expected format: src=image,dst=path[,readonly]", spec)
+	}
+
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			if part == "readonly" {
+				readonly = true
+				continue
+			}
+			return "", "", false, fmt.Errorf("invalid mount-image part %q", part)
+		}
+
+		key := strings.ToLower(kv[0])
+		value := kv[1]
+
+		switch key {
+		case "src":
+			imageRef = value
+		case "dst":
+			target = value
+		case "readonly":
+			if value == "true" {
+				readonly = true
+			}
+		}
+	}
+
+	if imageRef == "" {
+		return "", "", false, fmt.Errorf("mount-image requires src")
+	}
+	if target == "" {
+		return "", "", false, fmt.Errorf("mount-image requires dst")
+	}
+
+	return imageRef, target, readonly, nil
 }
 
 // generateMountOpts generates volume-related mount opts.
@@ -244,6 +287,110 @@ func generateMountOpts(ctx context.Context, client *containerd.Client, ensuredIm
 		mountPoints = append(mountPoints, parsed...)
 	}
 
+	// process mount-image
+	for _, mountImageSpec := range options.MountImage {
+		imageRef, targetPath, readonly, err := parseMountImageFlags(mountImageSpec)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		log.G(ctx).Debugf("mounting image %q rootfs to %q (readonly=%v)", imageRef, targetPath, readonly)
+
+		// "ensure" the image
+		mountImage, err := imgutil.EnsureImage(ctx, client, imageRef, options.ImagePullOpt)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to ensure mount-image %q: %w", imageRef, err)
+		}
+
+		if err := mountImage.Image.Unpack(ctx, options.GOptions.Snapshotter); err != nil {
+			return nil, nil, nil, fmt.Errorf("error unpacking mount-image %q: %w", imageRef, err)
+		}
+
+		// get the source image chain ID
+		diffIDs, err := mountImage.Image.RootFS(ctx)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		chainID := identity.ChainID(diffIDs).String()
+
+		// create a new snapshot view
+		s := client.SnapshotService(options.GOptions.Snapshotter)
+		viewKey := fmt.Sprintf("mount-image-%s", idgen.GenerateID())
+
+		// create lease for the snapshot view
+		ctx2, done, err := client.WithLease(ctx, leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		defer done(ctx2)
+
+		mounts, err := s.View(ctx2, viewKey, chainID)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create snapshot view: %w", err)
+		}
+
+		mountTempDir, err := os.MkdirTemp("", "mountImage")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		cleanup := func() {
+			if uerr := mount.Unmount(mountTempDir, 0); uerr != nil {
+				log.G(ctx).Debugf("Failed to unmount snapshot %q: %w", mountTempDir, uerr)
+			}
+			os.Remove(mountTempDir)
+			if rerr := s.Remove(ctx2, viewKey); rerr != nil && !errdefs.IsNotFound(rerr) {
+				log.G(ctx).Debugf("Failed to remove snapshot view %q: %v", viewKey, rerr)
+			}
+		}
+		defer cleanup()
+
+		// mount all layers
+		if err := mount.All(mounts, mountTempDir); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to mount snapshot: %w", err)
+		}
+
+		// create an anonymous volume to hold the image contents
+		anonVolName := idgen.GenerateID()
+		log.G(ctx).Debugf("creating volume %q for mount-image rootfs", anonVolName)
+
+		anonVol, err := volStore.CreateWithoutLock(anonVolName, []string{})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to create volume: %w", err)
+		}
+
+		// copy the entire image rootfs to the volume
+		log.G(ctx).Debugf("copying image rootfs from %q to volume %q", mountTempDir, anonVol.Mountpoint)
+		if err := copyImageContents(mountTempDir, anonVol.Mountpoint); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to copy image contents: %w", err)
+		}
+
+		// build mount options
+		mountOptions := []string{}
+		if readonly {
+			mountOptions = append(mountOptions, "ro")
+		}
+		if runtime.GOOS != "windows" {
+			mountOptions = append(mountOptions, "rbind")
+		}
+
+		m := specs.Mount{
+			Type:        mountutil.DefaultMountType,
+			Source:      anonVol.Mountpoint,
+			Destination: targetPath,
+			Options:     mountOptions,
+		}
+		userMounts = append(userMounts, m)
+		anonVolumes = append(anonVolumes, anonVolName)
+
+		mountPoint := &mountutil.Processed{
+			Type:            "volume",
+			AnonymousVolume: anonVolName,
+			Mount:           m,
+		}
+		mountPoints = append(mountPoints, mountPoint)
+	}
+
 	// imageVolumes are defined in Dockerfile "VOLUME" instruction
 	for imgVolRaw := range imageVolumes {
 		imgVol := filepath.Clean(imgVolRaw)
@@ -361,4 +508,60 @@ func copyExistingContents(source, destination string) error {
 		return nil
 	}
 	return fs.CopyDir(destination, source)
+}
+
+func copyImageContents(source, destination string) error {
+	if _, err := os.Stat(source); os.IsNotExist(err) {
+		return nil
+	}
+
+	dstList, err := os.ReadDir(destination)
+	if err != nil {
+		return err
+	}
+	if len(dstList) != 0 {
+		log.L.Debugf("volume at %q is not initially empty, skipping copy", destination)
+		return nil
+	}
+
+	if runtime.GOOS == "windows" {
+		return copyDirWithSkip(source, destination)
+	}
+
+	return fs.CopyDir(destination, source)
+}
+
+func copyDirWithSkip(source, destination string) error {
+	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.L.Debugf("skipping inaccessible file %q: %v", path, err)
+			return nil
+		}
+
+		relPath, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(destination, relPath)
+
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+
+		srcFile, err := os.Open(path)
+		if err != nil {
+			log.L.Debugf("skipping inaccessible file %q: %v", path, err)
+			return nil
+		}
+		defer srcFile.Close()
+
+		dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return err
+		}
+		defer dstFile.Close()
+
+		_, err = io.Copy(dstFile, srcFile)
+		return err
+	})
 }

@@ -229,6 +229,7 @@ func setCreateFlags(cmd *cobra.Command) {
 	cmd.Flags().StringArray("mount", nil, "Attach a filesystem mount to the container")
 	// volumes-from needs to be StringArray, not StringSlice, to prevent "id1,id2" from being split to {"id1", "id2"} (compatible with Docker)
 	cmd.Flags().StringArray("volumes-from", nil, "Mount volumes from the specified container(s)")
+	cmd.Flags().StringArray("mount-image", nil, "Attach a rootfs from an image to the container")
 	// #endregion
 
 	// rootfs flags

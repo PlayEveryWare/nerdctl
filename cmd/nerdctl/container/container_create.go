@@ -367,6 +367,10 @@ func createOptions(cmd *cobra.Command) (types.ContainerCreateOptions, error) {
 	if err != nil {
 		return opt, err
 	}
+	opt.MountImage, err = cmd.Flags().GetStringArray("mount-image")
+	if err != nil {
+		return opt, err
+	}
 	// #endregion
 
 	// #region for rootfs flags

@@ -221,6 +221,8 @@ type ContainerCreateOptions struct {
 	Mount []string
 	// VolumesFrom specifies a list of specified containers to mount from
 	VolumesFrom []string
+	// MountImage specifies a list of imgaes to mount from
+	MountImage []string
 	// #endregion
 
 	// #region for rootfs flags
