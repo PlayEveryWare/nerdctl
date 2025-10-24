@@ -133,6 +133,7 @@ func generateMountOpts(ctx context.Context, client *containerd.Client, ensuredIm
 		userMounts  []specs.Mount
 		mountPoints []*mountutil.Processed
 	)
+	canInspectImageFS := false
 	mounted := make(map[string]struct{})
 	var imageVolumes map[string]struct{}
 	var tempDir string
@@ -173,43 +174,62 @@ func generateMountOpts(ctx context.Context, client *containerd.Client, ensuredIm
 			return nil, nil, nil, err
 		}
 
-		// windows has additional steps for mounting see
-		// https://github.com/containerd/containerd/commit/791e175c79930a34cfbb2048fbcaa8493fd2c86b
-		unmounter := func(mountPath string) {
-			if uerr := mount.Unmount(mountPath, 0); uerr != nil {
-				log.G(ctx).Debugf("Failed to unmount snapshot %q", tempDir)
-				if err == nil {
-					err = uerr
-				}
-			}
+		///NOTE(mendsley): Attempt to use the mount manager
+		mm := client.MountManager()
+		mountID := fmt.Sprintf("nerdctl-mount-%s-%d", chainID[:12], time.Now().UnixNano())
+		active, err := mm.Activate(ctx, mountID, mounts)
+		if err == nil {
+			defer mm.Deactivate(ctx, mountID)
+			mounts = active.System
+			canInspectImageFS = true
+		} else if !errdefs.IsNotImplemented(err) {
+			return nil, nil, nil, fmt.Errorf("failed to activate mounts: %w", err)
 		}
 
-		if runtime.GOOS == "linux" {
-			defer unmounter(tempDir)
-			for _, m := range mounts {
-				m := m
-				if m.Type == "bind" && userns.RunningInUserNS() {
-					// For https://github.com/containerd/nerdctl/issues/2056
-					unpriv, err := mountutil.UnprivilegedMountFlags(m.Source)
-					if err != nil {
-						return nil, nil, nil, err
+		if errdefs.IsNotImplemented(err) {
+			log.G(ctx).Debugf("mount activation not implemented. skipping")
+			tempDir = ""
+		}
+
+		if canInspectImageFS {
+			// windows has additional steps for mounting see
+			// https://github.com/containerd/containerd/commit/791e175c79930a34cfbb2048fbcaa8493fd2c86b
+			unmounter := func(mountPath string) {
+				if uerr := mount.Unmount(mountPath, 0); uerr != nil {
+					log.G(ctx).Debugf("Failed to unmount snapshot %q", tempDir)
+					if err == nil {
+						err = uerr
 					}
-					m.Options = strutil.DedupeStrSlice(append(m.Options, unpriv...))
-				}
-				if err := m.Mount(tempDir); err != nil {
-					if rmErr := s.Remove(ctx, tempDir); rmErr != nil && !errdefs.IsNotFound(rmErr) {
-						return nil, nil, nil, rmErr
-					}
-					return nil, nil, nil, fmt.Errorf("failed to mount %+v on %q: %w", m, tempDir, err)
 				}
 			}
-		} else {
-			defer unmounter(tempDir)
-			if err := mount.All(mounts, tempDir); err != nil {
-				if err := s.Remove(ctx, tempDir); err != nil && !errdefs.IsNotFound(err) {
+
+			if runtime.GOOS == "linux" {
+				defer unmounter(tempDir)
+				for _, m := range mounts {
+					m := m
+					if m.Type == "bind" && userns.RunningInUserNS() {
+						// For https://github.com/containerd/nerdctl/issues/2056
+						unpriv, err := mountutil.UnprivilegedMountFlags(m.Source)
+						if err != nil {
+							return nil, nil, nil, err
+						}
+						m.Options = strutil.DedupeStrSlice(append(m.Options, unpriv...))
+					}
+					if err := m.Mount(tempDir); err != nil {
+						if rmErr := s.Remove(ctx, tempDir); rmErr != nil && !errdefs.IsNotFound(rmErr) {
+							return nil, nil, nil, rmErr
+						}
+						return nil, nil, nil, fmt.Errorf("failed to mount %+v on %q: %w", m, tempDir, err)
+					}
+				}
+			} else {
+				defer unmounter(tempDir)
+				if err := mount.All(mounts, tempDir); err != nil {
+					if err := s.Remove(ctx, tempDir); err != nil && !errdefs.IsNotFound(err) {
+						return nil, nil, nil, err
+					}
 					return nil, nil, nil, err
 				}
-				return nil, nil, nil, err
 			}
 		}
 	}
@@ -229,8 +249,10 @@ func generateMountOpts(ctx context.Context, client *containerd.Client, ensuredIm
 
 			// Copying content in AnonymousVolume and namedVolume
 			if x.Type == "volume" {
-				if err := copyExistingContents(target, x.Mount.Source); err != nil {
-					return nil, nil, nil, err
+				if canInspectImageFS {
+					if err := copyExistingContents(target, x.Mount.Source); err != nil {
+						return nil, nil, nil, err
+					}
 				}
 			}
 			if x.AnonymousVolume != "" {
@@ -269,8 +291,10 @@ func generateMountOpts(ctx context.Context, client *containerd.Client, ensuredIm
 		}
 
 		//copying up initial contents of the mount point directory
-		if err := copyExistingContents(target, anonVol.Mountpoint); err != nil {
-			return nil, nil, nil, err
+		if canInspectImageFS {
+			if err := copyExistingContents(target, anonVol.Mountpoint); err != nil {
+				return nil, nil, nil, err
+			}
 		}
 
 		m := specs.Mount{
